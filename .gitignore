@@ -15,6 +15,7 @@ site_out/
 # ByteClub: local artefacts
 .DS_Store
 *.pkl
+!/byteclub.pkl
 submit_ready/
 submit_next/
 results/

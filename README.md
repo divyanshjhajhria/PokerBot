@@ -7,6 +7,19 @@ The game engine, rules and tooling are the organisers'
 ([Manchester-AI-Society/poker_bot](https://github.com/Manchester-AI-Society/poker_bot)); their
 setup guide and API reference are in [CLAUDE.md](CLAUDE.md). Everything else here is ours.
 
+## Submission
+
+The submitted bot is these three files at the root of this repo:
+
+| File | What it is |
+|---|---|
+| `byteclub.pkl` | the bot object, pickled by `python -m submit --team byteclub` |
+| `model.py` | its code: `Model` with `seed`, `run` and `end_game` |
+| `preflop_tables.py` | precomputed equity tables, imported by `model.py` |
+
+The pickle was built from this exact `model.py`. To rebuild and check it the way the organisers
+do: `.venv/bin/python -m submit --team byteclub`.
+
 ## Team
 
 - Krishay
