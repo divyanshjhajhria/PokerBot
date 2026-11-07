@@ -1,0 +1,21 @@
+__pycache__/
+.venv/
+.hypothesis/
+.pytest_cache/
+site-src/node_modules/
+event/
+site_out/
+
+# The front end (the results web page) is kept by the organiser, not here.
+/site/
+/site-src/
+/tests/site_js/
+/event.json
+
+# ByteClub: local artefacts
+.DS_Store
+*.pkl
+submit_ready/
+submit_next/
+results/
+checkpoints/

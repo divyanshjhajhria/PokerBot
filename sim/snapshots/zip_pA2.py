@@ -1,0 +1,580 @@
+"""
+Heads-up no-limit hold'em bot for the GUH poker arena.
+
+Design (25 bb deep, stacks reset every hand, duplicate deals, scored by
+bb/100): maximise chip EV per hand, no survival concerns. Equity-driven
+decisions (precomputed preflop tables + Monte Carlo postflop) with an
+opponent profile learned within the rotation (fold-to-raise, fold-to-bet,
+jam frequency, VPIP/PFR) that switches the bot between exploit modes:
+steal vs folders, value-bomb vs stations, snap-call vs jammers.
+"""
+import random
+import time
+
+from card_utils import Card, evaluate, full_deck
+from player_action import DEALER, PlayerAction
+from preflop_tables import PCT, TOPS, VS_RANDOM, VS_TOP
+
+RANKS = "23456789TJQKA"
+
+
+def hand_key(cards):
+    a, b = cards[0], cards[1]
+    if a.value < b.value:
+        a, b = b, a
+    if a.rank == b.rank:
+        return a.rank + b.rank
+    return a.rank + b.rank + ("s" if a.suit == b.suit else "o")
+
+
+def _rate(k, n, prior, weight):
+    """Beta-smoothed rate: prior until enough observations."""
+    return (k + prior * weight) / (n + weight)
+
+
+def _new_stats():
+    return {
+        "hands": 0,
+        # preflop
+        "pre_opp": 0, "vpip": 0, "pfr": 0,
+        "open_opp": 0, "open_raise": 0, "open_jam": 0, "open_limp": 0,
+        "open_fold": 0,
+        "faced_raise": 0, "fold_to_raise": 0, "call_raise": 0,
+        "reraise": 0, "jam_over_raise": 0,
+        "faced_3bet": 0, "fold_to_3bet": 0,
+        # postflop
+        "bet_opp": 0, "bet_n": 0, "jam_post": 0,
+        "faced_bet": 0, "fold_to_bet": 0, "call_bet": 0, "raise_bet": 0,
+        "faced_small": 0, "fold_small": 0, "faced_big": 0, "fold_big": 0,
+        # showdown
+        "showdowns": 0, "sd_aggr": 0, "sd_aggr_weak": 0,
+    }
+
+
+class Model:
+    def __init__(self):
+        self.hand = []
+        self.player_id = None
+        self.rng = random.Random(20261107)
+        self.opp = {}  # team name -> stats dict
+        self.vs_random = dict(VS_RANDOM)
+        self.pct = dict(PCT)
+        self.tops = list(TOPS)
+        self.vs_top = {int(t): dict(d) for t, d in VS_TOP.items()}
+        # Every hole-card combo with its key, for range sampling.
+        deck = full_deck()
+        self.combos = []
+        for i in range(len(deck)):
+            for j in range(i + 1, len(deck)):
+                self.combos.append((deck[i], deck[j], hand_key([deck[i], deck[j]])))
+        self.mc_samples = 320
+        self.mc_time_cap = 0.3   # seconds per Monte Carlo call; samples cap too
+        self.mc_pool_cap = 300   # villain combos kept for ranking and sampling
+        self.cur = {}
+
+    # ------------------------------------------------------------------ hand
+    def seed(self, hand, player_id):
+        self.hand = list(hand)
+        self.player_id = player_id
+        self.cur = {
+            "ready": False, "street": "preflop", "board_n": 0,
+            "bets": {}, "max": 0, "committed": {}, "start": {},
+            "folded": set(), "allin": set(), "aggressor": None,
+            "pre_raises": 0, "last_aggr": {}, "shown": {}, "opp": None,
+            "we_raised_pre": False, "street_bets_opened": False,
+            "vmult": 1.0, "opp_last_post": None,
+        }
+
+    def _setup(self, gs):
+        c = self.cur
+        if c["ready"]:
+            return
+        n = gs.num_players
+        me = self.player_id
+        c["opp"] = [p for p in range(n) if p != me][0] if n == 2 else None
+        for p in range(n):
+            team = gs.teams[p]
+            if p != me and team not in self.opp:
+                self.opp[team] = _new_stats()
+            c["start"][p] = gs.stacks[p] + gs.bets[p]
+            c["committed"][p] = 0
+        c["bets"] = {p: 0 for p in range(n)}
+        sb = gs.button if n == 2 else (gs.button + 1) % n
+        bb = (sb + 1) % n
+        c["bets"][sb] = min(gs.small_blind, c["start"][sb])
+        c["bets"][bb] = min(gs.big_blind, c["start"][bb])
+        c["max"] = max(c["bets"].values())
+        c["sb"], c["bb"] = sb, bb
+        c["ready"] = True
+
+    def _stats(self, gs, p):
+        return self.opp[gs.teams[p]]
+
+    def _is_allin(self, p, total):
+        c = self.cur
+        return c["committed"].get(p, 0) + total >= c["start"].get(p, 500)
+
+    def _ingest(self, actions, gs):
+        """Replay actions since our last turn to learn about opponents."""
+        self._setup(gs)
+        c = self.cur
+        me = self.player_id
+        for a in actions:
+            if a.player_id == DEALER:
+                c["board_n"] += 1
+                if c["board_n"] in (3, 4, 5):
+                    for p in c["bets"]:
+                        c["committed"][p] += c["bets"][p]
+                        c["bets"][p] = 0
+                    c["max"] = 0
+                    c["street"] = {3: "flop", 4: "turn", 5: "river"}[c["board_n"]]
+                    c["aggressor"] = None
+                continue
+            p = a.player_id
+            if a.kind == "reveal_card":
+                c["shown"].setdefault(p, []).append(a.card)
+                continue
+            if a.kind == "win":
+                continue
+            facing = c["max"] > c["bets"].get(p, 0)
+            pre = c["street"] == "preflop"
+            if p != me:
+                pot_now = sum(c["committed"].values()) + sum(c["bets"].values())
+                bet_frac = (c["max"] - c["bets"].get(p, 0)) / max(1, pot_now - (c["max"] - c["bets"].get(p, 0)))
+                self._learn(gs, p, a, facing, pre, bet_frac)
+            if a.kind == "fold":
+                c["folded"].add(p)
+            elif a.kind == "call":
+                owed = c["max"] - c["bets"].get(p, 0)
+                room = c["start"].get(p, 500) - c["committed"].get(p, 0) - c["bets"].get(p, 0)
+                c["bets"][p] = c["bets"].get(p, 0) + min(owed, max(room, 0))
+                if room <= owed:
+                    c["allin"].add(p)
+            elif a.kind == "raise":
+                c["bets"][p] = a.amount
+                c["max"] = max(c["max"], a.amount)
+                c["aggressor"] = p
+                c["last_aggr"][c["street"]] = p
+                if pre:
+                    c["pre_raises"] += 1
+                    if p == me:
+                        c["we_raised_pre"] = True
+                if self._is_allin(p, a.amount):
+                    c["allin"].add(p)
+
+    def _learn(self, gs, p, a, facing, pre, bet_frac=0.0):
+        s = self._stats(gs, p)
+        c = self.cur
+        allin = a.kind == "raise" and self._is_allin(p, a.amount)
+        if not pre:
+            if a.kind == "raise":
+                c["opp_last_post"] = "raise" if facing else "bet"
+            elif a.kind == "call" and facing:
+                c["opp_last_post"] = "call"
+            # Their range narrows when they continue vs a bet.
+            if facing and a.kind == "call":
+                c["vmult"] *= 0.7
+            elif facing and a.kind == "raise":
+                c["vmult"] *= 0.4
+        if pre:
+            raised_before = c["max"] > gs.big_blind
+            s["pre_opp"] += 1
+            if a.kind in ("call", "raise") and (facing or a.kind == "raise"):
+                s["vpip"] += 1
+            if a.kind == "raise":
+                s["pfr"] += 1
+            if not raised_before:
+                if facing or a.kind == "raise":  # SB open, or BB raising a limp
+                    s["open_opp"] += 1
+                    if a.kind == "raise":
+                        s["open_raise"] += 1
+                        if allin:
+                            s["open_jam"] += 1
+                    elif a.kind == "call":
+                        s["open_limp"] += 1
+                    else:
+                        s["open_fold"] += 1
+            else:
+                if c["pre_raises"] >= 2:
+                    s["faced_3bet"] += 1
+                    if a.kind == "fold":
+                        s["fold_to_3bet"] += 1
+                s["faced_raise"] += 1
+                if a.kind == "fold":
+                    s["fold_to_raise"] += 1
+                elif a.kind == "call":
+                    s["call_raise"] += 1
+                else:
+                    s["reraise"] += 1
+                    if allin:
+                        s["jam_over_raise"] += 1
+        else:
+            if not facing:
+                s["bet_opp"] += 1
+                if a.kind == "raise":
+                    s["bet_n"] += 1
+                    if allin:
+                        s["jam_post"] += 1
+            else:
+                s["faced_bet"] += 1
+                small = bet_frac <= 0.42
+                s["faced_small" if small else "faced_big"] += 1
+                if a.kind == "fold":
+                    s["fold_to_bet"] += 1
+                    s["fold_small" if small else "fold_big"] += 1
+                elif a.kind == "call":
+                    s["call_bet"] += 1
+                else:
+                    s["raise_bet"] += 1
+
+    # ---------------------------------------------------------------- equity
+    def _eq_top(self, key, x):
+        """Preflop equity of key vs the top x% of hands (interpolated)."""
+        x = max(self.tops[0], min(100, x))
+        lo = max(t for t in self.tops if t <= x)
+        hi = min(t for t in self.tops if t >= x)
+        if lo == hi:
+            return self.vs_top[lo][key]
+        w = (x - lo) / (hi - lo)
+        return self.vs_top[lo][key] * (1 - w) + self.vs_top[hi][key] * w
+
+    def _mc_equity(self, board, top_pct, samples, band=None):
+        """Postflop equity vs a villain range = top_pct% of preflop hands,
+        by Monte Carlo over the unseen cards. band=(lo, hi) keeps only the
+        villain hands whose current made-hand strength on this board sits
+        between those quantiles (0 weakest .. 1 strongest). Sampling stops
+        at mc_time_cap seconds after the call starts (16 samples minimum)."""
+        t_end = time.perf_counter() + self.mc_time_cap
+        known = set(str(c) for c in self.hand) | set(str(c) for c in board)
+        limit = top_pct / 100.0
+        pool = [cb for cb in self.combos
+                if self.pct[cb[2]] <= limit + 1e-9
+                and str(cb[0]) not in known and str(cb[1]) not in known]
+        if len(pool) < 20:
+            pool = [cb for cb in self.combos
+                    if str(cb[0]) not in known and str(cb[1]) not in known]
+        if len(pool) > self.mc_pool_cap:   # bounds ranking + sampling cost
+            pool = self.rng.sample(pool, self.mc_pool_cap)
+        if band is not None and len(board) >= 3:
+            lo, hi = band
+            lo = max(0.0, min(0.95, lo))
+            hi = max(lo + 0.05, min(1.0, hi))
+            ranked = sorted(pool, key=lambda cb: evaluate([cb[0], cb[1]] + list(board)))
+            n = len(ranked)
+            sub = ranked[int(lo * n):max(int(lo * n) + 10, int(hi * n))]
+            if len(sub) >= 10:
+                pool = sub
+        deck = [c for c in full_deck() if str(c) not in known]
+        need = 5 - len(board)
+        rng = self.rng
+        won = 0.0
+        done = 0
+        for i in range(samples):
+            if i >= 16 and not (i & 15) and time.perf_counter() > t_end:
+                break
+            done += 1
+            v = pool[rng.randrange(len(pool))]
+            rest = [c for c in deck if c is not v[0] and c is not v[1]
+                    and str(c) != str(v[0]) and str(c) != str(v[1])]
+            draw = rng.sample(rest, need) if need else []
+            full = list(board) + draw
+            mine = evaluate(self.hand + full)
+            theirs = evaluate([v[0], v[1]] + full)
+            if mine > theirs:
+                won += 1
+            elif mine == theirs:
+                won += 0.5
+        return won / done
+
+    # --------------------------------------------------------------- helpers
+    def _raise(self, gs, total):
+        me = self.player_id
+        if not gs.can_raise:
+            return PlayerAction.call(me)
+        low, high = gs.raise_range
+        total = int(round(total))
+        total = min(high, max(low, total))
+        if total >= 0.72 * high:  # don't leave crumbs behind
+            total = high
+        return PlayerAction.raise_to(me, total)
+
+    def _call(self):
+        return PlayerAction.call(self.player_id)
+
+    def _fold_or_check(self, gs):
+        if gs.call_amount == 0:
+            return PlayerAction.call(self.player_id)
+        return PlayerAction.fold(self.player_id)
+
+    def _profile(self, gs, opp):
+        s = self._stats(gs, opp)
+        f_pre = _rate(s["fold_to_raise"], s["faced_raise"], 0.45, 6)
+        f_3b = _rate(s["fold_to_3bet"], s["faced_3bet"], 0.55, 4)
+        jam_over = _rate(s["jam_over_raise"], s["faced_raise"], 0.04, 4)
+        open_jam = _rate(s["open_jam"], s["open_opp"], 0.04, 5)
+        open_raise = _rate(s["open_raise"], s["open_opp"], 0.5, 5)
+        vpip = _rate(s["vpip"], s["pre_opp"], 0.6, 6)
+        pfr = _rate(s["pfr"], s["pre_opp"], 0.3, 6)
+        f_post = _rate(s["fold_to_bet"], s["faced_bet"], 0.4, 6)
+        f_small = _rate(s["fold_small"], s["faced_small"], 0.3, 4)
+        f_big = _rate(s["fold_big"], s["faced_big"], 0.5, 4)
+        bet_rate = _rate(s["bet_n"], s["bet_opp"], 0.4, 6)
+        jam_post = _rate(s["jam_post"], s["bet_opp"], 0.03, 6)
+        raise_bet = _rate(s["raise_bet"], s["faced_bet"], 0.1, 6)
+        n = s["hands"]
+        return {
+            "f_pre": f_pre, "f_3b": f_3b, "jam_over": jam_over,
+            "open_jam": open_jam, "open_raise": open_raise, "vpip": vpip,
+            "pfr": pfr, "f_post": f_post, "bet_rate": bet_rate,
+            "f_small": f_small, "f_big": f_big,
+            "size_sensitive": (s["faced_small"] + s["faced_big"] >= 6
+                               and f_big - f_small >= 0.3),
+            "jam_post": jam_post, "raise_bet": raise_bet, "n": n,
+            # labels
+            "maniac": (open_jam > 0.35 or jam_over > 0.35 or jam_post > 0.35),
+            "station": (s["faced_bet"] >= 6 and f_post < 0.18),
+            "station_pre": (s["faced_raise"] >= 6 and f_pre < 0.25),
+            "folder": (n >= 6 and f_post > 0.65 and f_pre > 0.6),
+            "passive": (n >= 8 and bet_rate < 0.2 and pfr < 0.15),
+            "aggro": (bet_rate > 0.6 or pfr > 0.6),
+        }
+
+    # ------------------------------------------------------------------ run
+    def run(self, actions, gs):
+        try:
+            self._ingest(actions, gs)
+            return self._decide(gs)
+        except Exception:
+            return self._fold_or_check(gs)
+
+    def _decide(self, gs):
+        me = self.player_id
+        c = self.cur
+        opp = c["opp"]
+        if opp is None:  # not heads-up: fall back to a plain equity line
+            return self._multiway(gs)
+        prof = self._profile(gs, opp)
+        key = hand_key(self.hand)
+        if gs.street == "preflop":
+            return self._preflop(gs, opp, prof, key)
+        return self._postflop(gs, opp, prof, key)
+
+    # -------------------------------------------------------------- preflop
+    def _jam_range_pct(self, prof, over_raise):
+        rate = prof["jam_over"] if over_raise else prof["open_jam"]
+        if prof["maniac"] or rate >= 0.35:
+            return 100.0
+        return max(6.0, min(100.0, 110.0 * rate))
+
+    def _preflop(self, gs, opp, prof, key):
+        me = self.player_id
+        c = self.cur
+        eqr = self.vs_random[key]
+        pct = self.pct[key]
+        to_call = gs.call_amount
+        po = gs.pot_odds
+        bb = gs.big_blind
+        opp_allin = gs.status(opp) == "all_in"
+        raised = gs.current_bet > bb
+
+        # --- facing an all-in: pure pot-odds call vs their jamming range
+        if opp_allin and to_call > 0:
+            x = self._jam_range_pct(prof, over_raise=c["we_raised_pre"])
+            eq = self._eq_top(key, x)
+            if eq > po + 0.005:
+                return self._call()
+            return PlayerAction.fold(me)
+
+        # --- facing a raise (not all-in)
+        if raised and to_call > 0:
+            x_open = max(8.0, min(80.0, 100.0 * (prof["pfr"] if c["pre_raises"] == 1 else prof["pfr"] * 0.5)))
+            eq = self._eq_top(key, x_open)
+            # value jam
+            if eq >= 0.58 or pct <= 0.06:
+                return self._raise(gs, gs.max_raise_to)
+            # light 3-bet jam when they fold to 3-bets a lot
+            if c["pre_raises"] == 1 and prof["f_3b"] >= 0.6 and eq >= 0.48 and not prof["station_pre"]:
+                return self._raise(gs, gs.max_raise_to)
+            if prof["station_pre"] and eq >= 0.52:
+                return self._raise(gs, 3 * gs.current_bet)
+            margin = 0.0 if prof["maniac"] or prof["aggro"] else 0.03
+            if eq >= po + margin:
+                return self._call()
+            return PlayerAction.fold(me)
+
+        # --- SB, first to act (to_call == small blind)
+        if to_call > 0:
+            if prof["maniac"] or prof["jam_over"] >= 0.15:
+                # EV of opening vs a bot that folds / jams / calls our raise.
+                stack = gs.stacks[me] + gs.bets[me]
+                p_jam = min(0.95, prof["jam_over"])
+                p_fold = min(1.0 - p_jam, prof["f_pre"])
+                p_call = max(0.0, 1.0 - p_jam - p_fold)
+                eq_j = self._eq_top(key, self._jam_range_pct(prof, over_raise=True))
+                eq_c = self._eq_top(key, max(20.0, min(100.0, 100.0 * prof["vpip"])))
+                best, best_size = -gs.small_blind, None
+                for size in (2 * bb, 2.5 * bb, 3 * bb):
+                    ev_call_jam = eq_j * 2 * stack - stack
+                    ev = (p_fold * bb + p_jam * max(ev_call_jam, -size)
+                          + p_call * ((2 * eq_c - 1) * size + 0.1 * size))
+                    if ev > best:
+                        best, best_size = ev, size
+                if best_size is None:
+                    return PlayerAction.fold(me)
+                return self._raise(gs, best_size)
+            if prof["folder"] or prof["f_pre"] >= 0.68:
+                return self._raise(gs, 2 * bb)  # they fold: min-raise anything
+            if prof["station_pre"]:
+                if pct <= 0.18:
+                    return self._raise(gs, 4 * bb)
+                if pct <= 0.55:
+                    return self._raise(gs, 2.5 * bb)
+                if pct <= 0.72:
+                    return self._call()  # limp, see a cheap flop in position
+                return PlayerAction.fold(me)
+            if pct <= 0.12:
+                return self._raise(gs, 3 * bb)
+            if pct <= 0.78:
+                return self._raise(gs, 2.5 * bb)
+            if pct <= 0.88 and prof["f_pre"] >= 0.5:
+                return self._raise(gs, 2 * bb)
+            return PlayerAction.fold(me)
+
+        # --- BB facing a limp (free check available)
+        if prof["folder"] or prof["f_pre"] >= 0.65:
+            return self._raise(gs, 3 * bb)
+        if pct <= 0.30:
+            return self._raise(gs, 4 * bb if prof["station_pre"] else 3.5 * bb)
+        return self._call()
+
+    # ------------------------------------------------------------- postflop
+    def _villain_pct(self, gs, opp, prof):
+        c = self.cur
+        s = self._stats(gs, opp)
+        if opp in c["allin"]:
+            return self._jam_range_pct(prof, over_raise=c["we_raised_pre"])
+        mult = 1.0 if prof["station"] else c["vmult"]
+        if c["last_aggr"].get("preflop") == opp:
+            return max(8.0, min(70.0, 100.0 * prof["pfr"]) * mult)
+        # they called preflop: wide, capped range
+        return max(8.0, min(100.0, 100.0 * prof["vpip"]) * mult)
+
+    def _postflop(self, gs, opp, prof, key):
+        me = self.player_id
+        c = self.cur
+        board = list(gs.board)
+        to_call = gs.call_amount
+        pot = gs.pot
+        po = gs.pot_odds
+        x = self._villain_pct(gs, opp, prof)
+        samples = self.mc_samples
+        band = None
+        last = c["opp_last_post"]
+        s = self._stats(gs, opp)
+        # How often their showdown-revealed aggression was weak: a random or
+        # bluff-heavy bettor's bets say little about their hand.
+        weak = _rate(s["sd_aggr_weak"], s["sd_aggr"], 0.35, 3)
+        honesty = max(0.0, 1.0 - weak)
+        if not prof["station"] and not prof["maniac"]:
+            if last == "bet":
+                band = ((1.0 - max(0.15, prof["bet_rate"])) * honesty, 1.0)
+            elif last == "raise":
+                band = ((1.0 - max(0.1, prof["raise_bet"])) * honesty, 1.0)
+            elif last == "call":
+                band = (min(0.6, prof["f_post"]) * honesty, 1.0 - min(0.5, prof["raise_bet"]) * honesty)
+        eq = self._mc_equity(board, x, samples, band)
+        eff = gs.effective_stack(me)
+        spr = eff / pot if pot else 9.0
+        street = gs.street
+        i_was_aggr = c["last_aggr"].get("preflop") == me or c["aggressor"] == me
+        station, folder, maniac = prof["station"], prof["folder"], prof["maniac"]
+
+        if to_call == 0:
+            # Value: bet big, bigger vs stations; jam when committed.
+            if eq >= 0.80 and spr <= 3.0:
+                return self._raise(gs, gs.max_raise_to)
+            value_size = pot * (1.0 if station else 0.75)
+            if prof["size_sensitive"]:
+                value_size = pot * 0.3  # they call small bets, fold to big
+            if eq >= 0.66:
+                if spr <= 1.3 and not prof["size_sensitive"]:
+                    return self._raise(gs, gs.max_raise_to)
+                return self._raise(gs, gs.bets[me] + value_size)
+            if eq >= 0.54 and not station:
+                size = pot * (0.45 if prof["f_post"] >= 0.5 else 0.6)
+                if prof["size_sensitive"]:
+                    size = pot * 0.3
+                return self._raise(gs, gs.bets[me] + size)
+            if eq >= 0.58 and station:
+                return self._raise(gs, gs.bets[me] + pot * 0.75)
+            # Bluffs only vs opponents who fold to bets.
+            if folder or prof["f_post"] >= 0.62 or (prof["size_sensitive"] and prof["f_big"] >= 0.6):
+                if self.rng.random() < 0.85:
+                    bluff = pot * (0.6 if prof["size_sensitive"] else 0.4)
+                    return self._raise(gs, gs.bets[me] + bluff)
+            elif i_was_aggr and street == "flop" and prof["f_post"] >= 0.45 and eq >= 0.35:
+                if self.rng.random() < 0.6:
+                    return self._raise(gs, gs.bets[me] + pot * 0.45)
+            return self._call()
+
+        # Facing a bet.
+        if maniac or prof["aggro"]:
+            margin = -0.01
+        elif prof["passive"]:
+            margin = 0.10
+        else:
+            margin = 0.04
+        if street == "river":
+            margin += 0.02
+        if gs.status(opp) == "all_in":
+            margin = 0.0 if not prof["passive"] else 0.06
+            if eq > po + margin:
+                return self._call()
+            return PlayerAction.fold(me)
+        if eq >= 0.74 and gs.can_raise:
+            if spr <= 2.5 or eq >= 0.85:
+                return self._raise(gs, gs.max_raise_to)
+            return self._raise(gs, gs.current_bet * 2.8)
+        if eq >= 0.62 and gs.can_raise and station:
+            return self._raise(gs, gs.current_bet * 2.5)
+        if eq >= po + margin:
+            return self._call()
+        return PlayerAction.fold(me)
+
+    # ------------------------------------------------------------- multiway
+    def _multiway(self, gs):
+        me = self.player_id
+        opps = len(gs.players_in_hand) - 1
+        if gs.street == "preflop":
+            key = hand_key(self.hand)
+            eq = self.vs_random[key] ** max(1, opps)
+        else:
+            eq = self._mc_equity(list(gs.board), 100.0, 200) ** max(1, opps)
+        if eq > 1.6 / (opps + 1) and gs.can_raise:
+            return self._raise(gs, gs.pot)
+        if eq > gs.pot_odds:
+            return self._call()
+        return self._fold_or_check(gs)
+
+    # ------------------------------------------------------------ end_game
+    def end_game(self, actions, gs):
+        try:
+            self._ingest(actions, gs)
+            me = self.player_id
+            for p in range(gs.num_players):
+                if p == me:
+                    continue
+                s = self._stats(gs, p)
+                s["hands"] += 1
+                shown = self.cur["shown"].get(p)
+                if shown and len(shown) == 2 and len(gs.board) == 5:
+                    s["showdowns"] += 1
+                    c = self.cur
+                    aggr_streets = [st for st, who in c["last_aggr"].items() if who == p and st != "preflop"]
+                    if aggr_streets:
+                        s["sd_aggr"] += 1
+                        rank = evaluate(list(shown) + list(gs.board))
+                        if rank[0] <= 1:  # high card or one pair when betting
+                            s["sd_aggr_weak"] += 1
+        except Exception:
+            pass
